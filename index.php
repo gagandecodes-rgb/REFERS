@@ -1,34 +1,42 @@
 <?php
 /**
- * FULL SINGLE-FILE TELEGRAM REFER BOT (FAST) + WEB VERIFY PAGE INSIDE SAME index.php
+ * ✅ FULL SINGLE-FILE index.php (Telegram Bot + Website Verify in SAME file)
  *
- * ✅ 3 refer = 1 coupon (deduct ONLY 3 points even if user has 5/6/7…)
- * ✅ 4 force-join channels (checked ONLY when user taps “✅ Check Verification”)
- * ✅ After “Check Verification” -> NEW message “Channel join verified! Next: Verify Yourself”
- * ✅ Then NEW message with BLUE “✅ Verify Now” button that opens website (this same index.php)
- * ✅ Website verifies + “1 device = 1 Telegram ID” (cookie device token + DB table device_links)
- * ✅ Coupon stock, remove/mark used, withdraw log
- * ✅ Admin panel: Add Coupon, Stock, Redeems Log
- * ✅ Admin gets message when coupon redeemed (time + points before/after)
+ * FEATURES:
+ * ✅ 3 refer = 1 coupon (deduct ONLY 3 points)
+ * ✅ Coupon stock + remove/mark used + withdrawals log
+ * ✅ Admin panel: add coupon / stock / redeems log
+ * ✅ 4 force-join channels (checked ONLY when user clicks "✅ Check Verification")
+ * ✅ AFTER join verified -> NEW message + Verification message
+ * ✅ NO "Verify Yourself" button (removed as you asked)
+ * ✅ Verification message has:
+ *    - ✅ Verify Now (URL opens website verify page like your screenshot)
+ *    - ✅ Check Verification (callback to confirm after returning)
+ * ✅ Website verify page:
+ *    - shows UI first
+ *    - user clicks ✅ Verify Now
+ *    - verifies in DB
+ *    - enforces "1 device token = 1 tg id"
+ *    - redirects back to Telegram bot
  *
  * REQUIRED Render ENV:
  * BOT_TOKEN, ADMIN_ID
  * DB_HOST, DB_PORT(5432), DB_NAME(postgres), DB_USER, DB_PASS
  * FORCE_JOIN_1..FORCE_JOIN_4 (e.g. @channelname)
- * BOT_USERNAME (optional for referral link speed)
+ * BOT_USERNAME (REQUIRED for redirect back to Telegram)
  *
- * REQUIRED DB tables/columns (run in Supabase SQL editor):
- * - users: tg_id (PK bigint), referred_by bigint, points int, total_referrals int,
- *          verified boolean, verified_at timestamptz, verify_token text, verify_token_expires timestamptz
- * - coupons: id bigserial, code text unique, used boolean, used_by bigint, used_at timestamptz, added_by bigint
- * - withdrawals: id bigserial, tg_id bigint, coupon_code text, points_deducted int, created_at timestamptz
- * - device_links: device_token text PK, tg_id bigint UNIQUE
+ * REQUIRED DB (Supabase SQL Editor) - ensure columns exist:
+ * users(tg_id PK bigint, referred_by bigint, points int default 0, total_referrals int default 0,
+ *       verified boolean default false, verified_at timestamptz, verify_token text, verify_token_expires timestamptz)
+ * coupons(id bigserial, code text unique, used boolean default false, used_by bigint, used_at timestamptz, added_by bigint, created_at timestamptz default now())
+ * withdrawals(id bigserial, tg_id bigint, coupon_code text, points_deducted int, created_at timestamptz default now())
+ * device_links(device_token text PK, tg_id bigint UNIQUE, created_at timestamptz default now())
  */
 
-// ---------- BASIC SETTINGS ----------
 error_reporting(0);
 ini_set("display_errors", 0);
 
+// ---------- SETTINGS ----------
 define("POINTS_PER_WITHDRAW", 3);
 define("VERIFY_TOKEN_MINUTES", 10);
 define("TG_CONNECT_TIMEOUT", 2);
@@ -37,7 +45,7 @@ define("TG_TIMEOUT", 6);
 // ---------- ENV ----------
 $BOT_TOKEN    = getenv("BOT_TOKEN");
 $ADMIN_ID     = getenv("ADMIN_ID");
-$BOT_USERNAME = getenv("BOT_USERNAME"); // optional (no @)
+$BOT_USERNAME = getenv("BOT_USERNAME"); // IMPORTANT (no @) for redirect
 
 $DB_HOST = getenv("DB_HOST");
 $DB_PORT = getenv("DB_PORT") ?: "5432";
@@ -65,11 +73,12 @@ try {
 }
 function dbReady(){ global $pdo; return $pdo instanceof PDO; }
 
-// ---------- URL (for verify page) ----------
+// ---------- URL HELPERS ----------
 function baseUrlThisFile() {
   $proto = "https";
   if (!empty($_SERVER["HTTP_X_FORWARDED_PROTO"])) $proto = $_SERVER["HTTP_X_FORWARDED_PROTO"];
   elseif (!empty($_SERVER["HTTPS"]) && $_SERVER["HTTPS"] !== "off") $proto = "https";
+
   $host = $_SERVER["HTTP_X_FORWARDED_HOST"] ?? ($_SERVER["HTTP_HOST"] ?? "");
   $path = $_SERVER["SCRIPT_NAME"] ?? "/index.php";
   if (!$host) return "";
@@ -145,16 +154,16 @@ function joinMarkup() {
     ]];
     $i++;
   }
-  // like your screenshot
-  $rows[] = [[ "text" => "🔐 Verify Yourself", "callback_data" => "show_verify_info" ]];
+  // ✅ Only Check Verification (Verify Yourself removed)
   $rows[] = [[ "text" => "✅ Check Verification", "callback_data" => "check_join" ]];
   return ["inline_keyboard" => $rows];
 }
 
-function verifyNowUrlButton($url) {
-  // Blue URL button
+function verifyMenuMarkup($verifyUrl) {
+  // Like your photo: Verify Now + Check Verification
   return ["inline_keyboard" => [
-    [[ "text" => "✅ Verify Now", "url" => $url ]]
+    [[ "text" => "✅ Verify Now", "url" => $verifyUrl ]],
+    [[ "text" => "✅ Check Verification", "callback_data" => "check_verified" ]]
   ]];
 }
 
@@ -187,7 +196,7 @@ function adminPanelMarkup() {
   ]];
 }
 
-// ---------- ADMIN ADD COUPON STATE (small local file) ----------
+// ---------- ADMIN ADD COUPON STATE ----------
 function stateDir() {
   $d = __DIR__ . "/state";
   if (!is_dir($d)) @mkdir($d, 0777, true);
@@ -231,7 +240,7 @@ function makeVerifyLink($tg_id) {
   $pdo->prepare("UPDATE users SET verify_token=:t, verify_token_expires=NOW() + (:m || ' minutes')::interval WHERE tg_id=:tg")
       ->execute([":t" => $token, ":m" => VERIFY_TOKEN_MINUTES, ":tg" => $tg_id]);
 
-  $base = baseUrlThisFile(); // same index.php
+  $base = baseUrlThisFile(); // this index.php
   return $base . "?mode=verify&uid=" . urlencode($tg_id) . "&token=" . urlencode($token);
 }
 
@@ -246,7 +255,7 @@ function notifyAdminRedeem($tg_id, $coupon, $beforePoints, $afterPoints) {
   sendMessage($ADMIN_ID, $msg);
 }
 
-// ---------- JOIN CHECK (ONLY WHEN user taps Check Verification) ----------
+// ---------- JOIN CHECK ----------
 function checkMember($user_id, $chat) {
   $r = tg("getChatMember", ["chat_id" => $chat, "user_id" => $user_id]);
   if (!$r || empty($r["ok"])) return false;
@@ -263,6 +272,7 @@ function allJoined($tg_id) {
   return true;
 }
 
+// ---------- BOT USERNAME ----------
 function botUsername() {
   global $BOT_USERNAME;
   if ($BOT_USERNAME) return ltrim($BOT_USERNAME, "@");
@@ -271,45 +281,58 @@ function botUsername() {
 }
 
 // =======================================================
-// =============== WEB VERIFY PAGE (GET) =================
+// ================= WEBSITE VERIFY (GET) =================
 // =======================================================
-function htmlPage($title, $msg) {
+function htmlVerifyUI($title, $msg, $doUrl) {
+  $btn = $doUrl ? '<a class="btn" href="'.htmlspecialchars($doUrl).'">✅ Verify Now</a>' : '';
   return '<!doctype html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>'.htmlspecialchars($title).'</title>
 <style>
-  body{margin:0;font-family:system-ui;background:#0b1220;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;}
-  .card{width:min(520px,92vw);background:#111a2c;border-radius:18px;padding:22px;box-shadow:0 10px 30px rgba(0,0,0,.35);}
-  .h{font-size:28px;font-weight:800;margin:0 0 8px;}
-  .p{opacity:.85;line-height:1.4;margin:0 0 14px;}
-  .btn{display:inline-block;background:#2f6dff;color:#fff;padding:14px 18px;border-radius:12px;text-decoration:none;font-weight:700;}
+  body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(#061020,#0b1220);font-family:system-ui;color:#fff;}
+  .card{width:min(560px,92vw);background:#0f1a2b;border-radius:22px;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.45);}
+  .h{font-size:28px;font-weight:800;margin:0 0 10px}
+  .p{opacity:.85;line-height:1.4;margin:0 0 16px;font-size:16px}
+  .btn{display:block;text-align:center;background:#2f6dff;color:#fff;padding:14px 16px;border-radius:14px;text-decoration:none;font-weight:800;font-size:18px}
+  .sub{margin-top:14px;opacity:.6}
 </style>
 </head>
 <body>
   <div class="card">
     <div class="h">🔐 '.htmlspecialchars($title).'</div>
     <div class="p">'.htmlspecialchars($msg).'</div>
-    <div class="p">You can close this page and return to Telegram.</div>
+    '.$btn.'
+    <div class="sub">Ready.</div>
   </div>
 </body>
 </html>';
 }
 
-// Handle verify website on GET
 if ($_SERVER["REQUEST_METHOD"] === "GET") {
   $mode  = $_GET["mode"] ?? "";
-  $uid   = (int)($_GET["uid"] ?? 0);
-  $token = trim($_GET["token"] ?? "");
-
-  // Normal health check
   if ($mode !== "verify") { echo "OK"; exit; }
 
-  if (!dbReady()) { echo htmlPage("DB Error", "Database not connected."); exit; }
-  if (!$uid || !$token) { echo htmlPage("Invalid", "Invalid verification link."); exit; }
+  if (!dbReady()) { echo htmlVerifyUI("DB Error", "Database not connected.", null); exit; }
 
-  // Device token cookie (1 device approx = 1 TG ID)
+  $uid   = (int)($_GET["uid"] ?? 0);
+  $token = trim($_GET["token"] ?? "");
+  $step  = $_GET["step"] ?? "";
+
+  if (!$uid || !$token) { echo htmlVerifyUI("Invalid", "Invalid verification link.", null); exit; }
+
+  // Show UI first (like photo 3)
+  if ($step !== "do") {
+    $doUrl = baseUrlThisFile()."?mode=verify&uid=".$uid."&token=".urlencode($token)."&step=do";
+    echo htmlVerifyUI("Verification", "Tap below to verify. This blocks fake referrals and keeps rewards fair.", $doUrl);
+    exit;
+  }
+
+  // Step=do -> verify now
+  global $pdo;
+
+  // Device token cookie (1 device ≈ 1 TG ID)
   $cookieName = "device_token";
   if (empty($_COOKIE[$cookieName]) || strlen($_COOKIE[$cookieName]) < 20) {
     $dt = bin2hex(random_bytes(16));
@@ -320,71 +343,67 @@ if ($_SERVER["REQUEST_METHOD"] === "GET") {
 
   // Ensure user exists
   try {
-    global $pdo;
     $pdo->prepare("INSERT INTO users (tg_id) VALUES (:tg) ON CONFLICT (tg_id) DO NOTHING")
         ->execute([":tg" => $uid]);
   } catch (Exception $e) {
-    echo htmlPage("Error", "User create failed."); exit;
+    echo htmlVerifyUI("Error", "User create failed.", null); exit;
   }
 
-  // Validate verify token + expiry
-  $u = null;
-  try {
-    $st = $pdo->prepare("SELECT verified, verify_token, verify_token_expires FROM users WHERE tg_id=:tg LIMIT 1");
-    $st->execute([":tg" => $uid]);
-    $u = $st->fetch();
-  } catch (Exception $e) {}
+  // Validate token + expiry
+  $st = $pdo->prepare("SELECT verified, verify_token, verify_token_expires FROM users WHERE tg_id=:tg LIMIT 1");
+  $st->execute([":tg" => $uid]);
+  $u = $st->fetch();
 
-  if (!$u) { echo htmlPage("Error", "User not found."); exit; }
-  if (!empty($u["verified"])) { echo htmlPage("Verified", "Already verified. You can use the bot now."); exit; }
-
-  if (($u["verify_token"] ?? "") !== $token) {
-    echo htmlPage("Invalid", "This verify link is not valid. Go back to Telegram and press Check Verification again.");
+  if (!$u) { echo htmlVerifyUI("Error", "User not found.", null); exit; }
+  if (!empty($u["verified"])) {
+    // Already verified: redirect back to Telegram
+    $bot = botUsername();
+    header("Location: https://t.me/".$bot);
     exit;
   }
-
+  if (($u["verify_token"] ?? "") !== $token) {
+    echo htmlVerifyUI("Invalid", "This verify link is not valid. Go back and press Check Verification again.", null);
+    exit;
+  }
   $exp = $u["verify_token_expires"] ?? "";
   if (!$exp || strtotime($exp) < time()) {
-    echo htmlPage("Expired", "Verify link expired. Go back to Telegram and press Check Verification again.");
+    echo htmlVerifyUI("Expired", "Verify link expired. Go back and press Check Verification again.", null);
     exit;
   }
 
-  // Device lock: device_links(device_token -> tg_id) must be unique
-  try {
-    $st = $pdo->prepare("SELECT tg_id FROM device_links WHERE device_token=:dt LIMIT 1");
-    $st->execute([":dt" => $deviceToken]);
-    $existing = $st->fetch();
-    if ($existing && (int)$existing["tg_id"] !== $uid) {
-      echo htmlPage("Blocked", "This device is already registered with another Telegram ID.");
-      exit;
-    }
-  } catch (Exception $e) {
-    echo htmlPage("DB Error", "Device lock check failed. Make sure device_links table exists.");
+  // Device lock: device_links(device_token) can belong to only one tg_id
+  $st = $pdo->prepare("SELECT tg_id FROM device_links WHERE device_token=:dt LIMIT 1");
+  $st->execute([":dt" => $deviceToken]);
+  $existing = $st->fetch();
+  if ($existing && (int)$existing["tg_id"] !== $uid) {
+    echo htmlVerifyUI("Blocked", "❌ This device is already registered with another Telegram ID.", null);
     exit;
   }
 
-  // Link device -> this uid (first-time)
+  // Link device -> tg_id
   try {
     $pdo->prepare("INSERT INTO device_links (device_token, tg_id) VALUES (:dt,:tg)
                    ON CONFLICT (device_token) DO UPDATE SET tg_id=EXCLUDED.tg_id")
         ->execute([":dt" => $deviceToken, ":tg" => $uid]);
   } catch (Exception $e) {
-    echo htmlPage("DB Error", "Device link failed. Make sure device_links exists.");
+    echo htmlVerifyUI("DB Error", "Device lock table missing. Create device_links table in Supabase.", null);
     exit;
   }
 
-  // Mark user verified and clear token
+  // Mark verified & clear token
   try {
     $pdo->prepare("UPDATE users
                    SET verified=true, verified_at=NOW(), verify_token=NULL, verify_token_expires=NULL
                    WHERE tg_id=:tg")
         ->execute([":tg" => $uid]);
   } catch (Exception $e) {
-    echo htmlPage("DB Error", "Verification update failed. Make sure users has verified/verify_token columns.");
+    echo htmlVerifyUI("DB Error", "Missing columns in users table. Add verified/verify_token columns.", null);
     exit;
   }
 
-  echo htmlPage("Verified", "Verification successful. Return to Telegram and press /start.");
+  // Redirect back to Telegram bot
+  $bot = botUsername();
+  header("Location: https://t.me/".$bot);
   exit;
 }
 
@@ -458,7 +477,6 @@ if (isset($update["message"])) {
       upsertUser($from_id, null);
     }
 
-    // If verified -> main menu else join screen
     if (isVerifiedUser($from_id)) {
       sendMessage($chat_id, "🎉 <b>WELCOME!</b>\nChoose an option:", mainMenuMarkup(isAdmin($from_id)));
     } else {
@@ -488,40 +506,38 @@ if (isset($update["callback_query"])) {
 
   upsertUser($from_id, null);
 
-  // Just instructions
-  if ($data === "show_verify_info") {
-    answerCallback($cq["id"], "Follow steps");
-    sendMessage(
-      $chat_id,
-      "✅ <b>Channel join verified?</b>\nNext: <b>Verify Yourself</b>\n\n"
-      . "1) Join all channels\n"
-      . "2) Tap <b>✅ Check Verification</b>\n"
-      . "3) Then tap <b>✅ Verify Now</b> (blue button).",
-      joinMarkup()
-    );
-    http_response_code(200); echo "OK"; exit;
-  }
-
-  // CHECK JOIN -> send NEW messages (as you requested)
+  // Check join -> send NEW messages + verification menu
   if ($data === "check_join") {
     answerCallback($cq["id"], "Checking...");
 
     if (allJoined($from_id)) {
-      // NEW MESSAGE 1
       sendMessage($chat_id, "✅ <b>Channel join verified!</b>\nNext: <b>Verify Yourself</b>");
 
-      // NEW MESSAGE 2 (blue button opens website)
       $url = makeVerifyLink($from_id);
       sendMessage(
         $chat_id,
         "🔐 <b>Verification</b>\nTap below to verify. This blocks fake referrals and keeps rewards fair.",
-        verifyNowUrlButton($url)
+        verifyMenuMarkup($url)
       );
     } else {
+      sendMessage($chat_id, "❌ <b>Verification failed.</b>\nJoin all channels then try again.", joinMarkup());
+    }
+
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  // Check verified after returning from website
+  if ($data === "check_verified") {
+    answerCallback($cq["id"], "Checking...");
+
+    if (isVerifiedUser($from_id)) {
+      sendMessage($chat_id, "✅ <b>Verified Successfully!</b>\nYou can now use the bot.", mainMenuMarkup(isAdmin($from_id)));
+    } else {
+      $url = makeVerifyLink($from_id);
       sendMessage(
         $chat_id,
-        "❌ <b>Verification failed.</b>\nYou must join all channels to use the bot.",
-        joinMarkup()
+        "❌ <b>Not verified yet.</b>\n\n1) Tap ✅ Verify Now\n2) Complete verification on website\n3) Come back and tap ✅ Check Verification",
+        verifyMenuMarkup($url)
       );
     }
 
@@ -574,7 +590,6 @@ if (isset($update["callback_query"])) {
       global $pdo;
       $pdo->beginTransaction();
 
-      // Avoid waiting on locks
       $st = $pdo->query("SELECT id, code FROM coupons WHERE used=false ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED");
       $coupon = $st->fetch();
 
@@ -588,7 +603,6 @@ if (isset($update["callback_query"])) {
       $before = (int)$u["points"];
       $after  = $before - $need;
 
-      // Deduct ONLY 3
       $st = $pdo->prepare("UPDATE users SET points = points - :need WHERE tg_id=:tg AND points >= :need");
       $st->execute([":need" => $need, ":tg" => $from_id]);
       if ($st->rowCount() < 1) {
