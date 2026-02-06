@@ -1,14 +1,13 @@
 <?php
 error_reporting(0);
-ini_set("display_errors", 0);
+ini_set("display_errors",0);
 
-define("VERIFY_TOKEN_MINUTES", 10);
-define("TG_CONNECT_TIMEOUT", 2);
-define("TG_TIMEOUT", 6);
+define("TG_CONNECT_TIMEOUT",2);
+define("TG_TIMEOUT",6);
 
 /* ================= ENV ================= */
-$BOT_TOKEN    = getenv("BOT_TOKEN");
-$ADMIN_ID     = getenv("ADMIN_ID");
+$BOT_TOKEN = getenv("BOT_TOKEN");
+$ADMIN_ID  = getenv("ADMIN_ID");
 $BOT_USERNAME = getenv("BOT_USERNAME");
 
 $DB_HOST = getenv("DB_HOST");
@@ -17,22 +16,19 @@ $DB_NAME = getenv("DB_NAME") ?: "postgres";
 $DB_USER = getenv("DB_USER");
 $DB_PASS = getenv("DB_PASS");
 
-if (!$BOT_TOKEN) { http_response_code(200); exit; }
 $API = "https://api.telegram.org/bot{$BOT_TOKEN}";
+if(!$BOT_TOKEN){ http_response_code(200); exit; }
 
 /* ================= DB ================= */
-try {
-  $pdo = new PDO(
+try{
+  $pdo=new PDO(
     "pgsql:host=$DB_HOST;port=$DB_PORT;dbname=$DB_NAME;sslmode=require",
-    $DB_USER,
-    $DB_PASS,
-    [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]
+    $DB_USER,$DB_PASS,
+    [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]
   );
-} catch (Exception $e) {
-  http_response_code(200); exit;
-}
+}catch(Exception $e){ http_response_code(200); exit; }
 
-/* ================= HELPERS ================= */
+/* ================= TG HELPERS ================= */
 function tg($m,$d=[]){
   global $API;
   $c=curl_init("$API/$m");
@@ -50,10 +46,10 @@ function tg($m,$d=[]){
 function send($cid,$txt,$kb=null){
   $d=["chat_id"=>$cid,"text"=>$txt,"parse_mode"=>"HTML","disable_web_page_preview"=>true];
   if($kb) $d["reply_markup"]=json_encode($kb);
-  return tg("sendMessage",$d);
+  tg("sendMessage",$d);
 }
 function answer($id,$t="",$a=false){
-  return tg("answerCallbackQuery",["callback_query_id"=>$id,"text"=>$t,"show_alert"=>$a?"true":"false"]);
+  tg("answerCallbackQuery",["callback_query_id"=>$id,"text"=>$t,"show_alert"=>$a?"true":"false"]);
 }
 function isAdmin($id){ global $ADMIN_ID; return (string)$id===(string)$ADMIN_ID; }
 
@@ -63,7 +59,7 @@ function channels(){
     getenv("FORCE_JOIN_1"),
     getenv("FORCE_JOIN_2"),
     getenv("FORCE_JOIN_3"),
-    getenv("FORCE_JOIN_4"),
+    getenv("FORCE_JOIN_4")
   ]);
 }
 function checkMember($uid,$ch){
@@ -78,43 +74,51 @@ function allJoined($uid){
   }
   return true;
 }
-function joinMarkup(){
-  $rows=[];
-  foreach(channels() as $i=>$c){
-    if(!$c) continue;
-    $rows[]=[[ "text"=>"✅ Join ".($i+1), "url"=>"https://t.me/".ltrim($c,"@") ]];
+
+/* ================= DB HELPERS ================= */
+function user($id){
+  global $pdo;
+  $s=$pdo->prepare("SELECT * FROM users WHERE tg_id=?");
+  $s->execute([$id]);
+  return $s->fetch();
+}
+function ensureUser($id,$ref=null){
+  global $pdo;
+  if(!user($id)){
+    $pdo->prepare("INSERT INTO users (tg_id,referred_by) VALUES (?,?)")->execute([$id,$ref]);
+    if($ref){
+      $pdo->prepare("UPDATE users SET points=points+1,total_referrals=total_referrals+1 WHERE tg_id=?")
+          ->execute([$ref]);
+    }
   }
-  $rows[]=[[ "text"=>"✅ Check Verification","callback_data"=>"check_join" ]];
-  return ["inline_keyboard"=>$rows];
+}
+function verified($id){
+  $u=user($id);
+  return $u && $u["verified"];
+}
+function getWithdrawPoints($amount){
+  global $pdo;
+  $s=$pdo->prepare("SELECT points FROM withdraw_points WHERE amount=?");
+  $s->execute([$amount]);
+  $r=$s->fetch();
+  return $r?(int)$r["points"]:0;
 }
 
-/* ================= UI ================= */
+/* ================= MENUS ================= */
 function mainMenu($admin=false){
   $r=[
-    [
-      ["text"=>"📊 Stats","callback_data"=>"stats"],
-      ["text"=>"🎁 Withdraw","callback_data"=>"withdraw"]
-    ],
-    [[ "text"=>"🔗 My Referral Link","callback_data"=>"reflink" ]]
+    [["text"=>"📊 Stats","callback_data"=>"stats"],["text"=>"🎁 Withdraw","callback_data"=>"withdraw"]],
+    [["text"=>"🔗 My Referral Link","callback_data"=>"reflink"]]
   ];
-  if($admin) $r[]=[[ "text"=>"🛠 Admin Panel","callback_data"=>"admin_panel" ]];
+  if($admin) $r[]=[["text"=>"🛠 Admin Panel","callback_data"=>"admin_panel"]];
   return ["inline_keyboard"=>$r];
-}
-function verifyMenu($url){
-  return ["inline_keyboard"=>[
-    [[ "text"=>"✅ Verify Now","url"=>$url ]],
-    [[ "text"=>"✅ Check Verification","callback_data"=>"check_verified" ]]
-  ]];
 }
 function adminMenu(){
   return ["inline_keyboard"=>[
-    [
-      ["text"=>"➕ Add Coupon","callback_data"=>"admin_add_coupon"],
-      ["text"=>"📦 Coupon Stock","callback_data"=>"admin_stock"]
-    ],
-    [[ "text"=>"🗂 Redeems Log","callback_data"=>"admin_redeems"]],
-    [[ "text"=>"⚙ Change Withdraw Points","callback_data"=>"admin_points"]],
-    [[ "text"=>"⬅ Back","callback_data"=>"back_main"]]
+    [["text"=>"➕ Add Coupon","callback_data"=>"admin_add_coupon"],["text"=>"📦 Coupon Stock","callback_data"=>"admin_stock"]],
+    [["text"=>"🗂 Redeem Logs","callback_data"=>"admin_redeems"]],
+    [["text"=>"⚙ Change Withdraw Points","callback_data"=>"admin_points"]],
+    [["text"=>"⬅ Back","callback_data"=>"back_main"]]
   ]];
 }
 
@@ -123,71 +127,6 @@ function stateDir(){ $d=__DIR__."/state"; if(!is_dir($d)) mkdir($d,0777,true); r
 function setState($u,$s){ file_put_contents(stateDir()."/$u",$s); }
 function getState($u){ $f=stateDir()."/$u"; return file_exists($f)?trim(file_get_contents($f)):""; }
 function clearState($u){ $f=stateDir()."/$u"; if(file_exists($f)) unlink($f); }
-
-/* ================= DB HELPERS ================= */
-function user($id){ global $pdo; $s=$pdo->prepare("SELECT * FROM users WHERE tg_id=?");$s->execute([$id]);return $s->fetch(); }
-function ensureUser($id,$ref=null){
-  global $pdo;
-  if(!user($id)){
-    $pdo->prepare("INSERT INTO users (tg_id,referred_by) VALUES (?,?)")->execute([$id,$ref]);
-    if($ref) $pdo->prepare("UPDATE users SET points=points+1,total_referrals=total_referrals+1 WHERE tg_id=?")->execute([$ref]);
-  }
-}
-function verified($id){ $u=user($id); return $u && $u["verified"]; }
-function getPointsFor($amt){
-  global $pdo;
-  $s=$pdo->prepare("SELECT points FROM withdraw_points WHERE amount=?");
-  $s->execute([$amt]);
-  $r=$s->fetch();
-  return $r?(int)$r["points"]:0;
-}
-
-/* ================= VERIFY LINK ================= */
-function baseUrl(){
-  $p=(!empty($_SERVER["HTTP_X_FORWARDED_PROTO"]))?$_SERVER["HTTP_X_FORWARDED_PROTO"]:"https";
-  $h=$_SERVER["HTTP_X_FORWARDED_HOST"]??$_SERVER["HTTP_HOST"];
-  return "$p://$h".$_SERVER["SCRIPT_NAME"];
-}
-function makeVerify($uid){
-  global $pdo;
-  $t=bin2hex(random_bytes(16));
-  $pdo->prepare("UPDATE users SET verify_token=?, verify_token_expires=NOW()+INTERVAL '10 minutes' WHERE tg_id=?")
-      ->execute([$t,$uid]);
-  return baseUrl()."?mode=verify&uid=$uid&token=$t";
-}
-
-/* ================= WEBSITE VERIFY ================= */
-if($_SERVER["REQUEST_METHOD"]==="GET" && ($_GET["mode"]??"")==="verify"){
-  $uid=(int)($_GET["uid"]??0);
-  $tok=$_GET["token"]??"";
-  $step=$_GET["step"]??"";
-  if(!$uid||!$tok){ echo "Invalid"; exit; }
-
-  if($step!=="do"){
-    $go=baseUrl()."?mode=verify&uid=$uid&token=$tok&step=do";
-    echo "<html><body style='background:#0f172a;color:#fff;font-family:Arial;display:flex;align-items:center;justify-content:center;height:100vh'>
-    <a href='$go' style='background:#22c55e;color:#000;padding:14px 20px;border-radius:12px;text-decoration:none;font-weight:700'>✅ Verify Now</a>
-    </body></html>";
-    exit;
-  }
-
-  $u=user($uid);
-  if(!$u||$u["verify_token"]!==$tok||strtotime($u["verify_token_expires"])<time()){ echo "Expired"; exit; }
-
-  $dt=$_COOKIE["device_token"]??bin2hex(random_bytes(16));
-  setcookie("device_token",$dt,time()+31536000,"/");
-  $c=$pdo->prepare("SELECT tg_id FROM device_links WHERE device_token=?");
-  $c->execute([$dt]);
-  $ex=$c->fetch();
-  if($ex && (int)$ex["tg_id"]!==$uid){ echo "Blocked"; exit; }
-
-  $pdo->prepare("INSERT INTO device_links (device_token,tg_id) VALUES (?,?) ON CONFLICT (device_token) DO UPDATE SET tg_id=EXCLUDED.tg_id")
-      ->execute([$dt,$uid]);
-  $pdo->prepare("UPDATE users SET verified=true,verify_token=NULL,verify_token_expires=NULL WHERE tg_id=?")->execute([$uid]);
-
-  header("Location: https://t.me/".ltrim($BOT_USERNAME,"@"));
-  exit;
-}
 
 /* ================= WEBHOOK ================= */
 $up=json_decode(file_get_contents("php://input"),true);
@@ -205,14 +144,31 @@ if(isset($up["message"])){
     $p=explode(" ",$txt);
     if(isset($p[1])&&ctype_digit($p[1])) $ref=(int)$p[1];
     ensureUser($uid,$ref && $ref!=$uid?$ref:null);
-    if(verified($uid)) send($cid,"🏠 Menu:",mainMenu(isAdmin($uid)));
-    else send($cid,"Join all channels then verify.",joinMarkup());
+
+    if(verified($uid)) send($cid,"🏠 Main Menu:",mainMenu(isAdmin($uid)));
+    else send($cid,"Join channels then verify.",["inline_keyboard"=>[[["text"=>"✅ Check Verification","callback_data"=>"check_join"]]]]);
     exit;
   }
 
-  ensureUser($uid);
-  if(verified($uid)) send($cid,"🏠 Menu:",mainMenu(isAdmin($uid)));
-  else send($cid,"Join all channels then verify.",joinMarkup());
+  if(isAdmin($uid) && strpos(getState($uid),"add_coupon_")===0){
+    $amount=(int)str_replace("add_coupon_","",getState($uid));
+    $codes=preg_split("/\s+|,|\n/",$txt);
+    $added=0;
+    foreach($codes as $c){
+      $c=trim($c);
+      if(!$c) continue;
+      try{
+        $pdo->prepare("INSERT INTO coupons (code,amount,added_by) VALUES (?,?,?)")
+            ->execute([$c,$amount,$uid]);
+        $added++;
+      }catch(Exception $e){}
+    }
+    clearState($uid);
+    send($cid,"✅ Added {$added} coupon(s).",adminMenu());
+    exit;
+  }
+
+  send($cid,"🏠 Main Menu:",mainMenu(isAdmin($uid)));
   exit;
 }
 
@@ -226,32 +182,29 @@ if(isset($up["callback_query"])){
 
   ensureUser($uid);
 
-  if($d==="check_join"){
-    if(allJoined($uid)){
-      send($cid,"Channels verified!");
-      send($cid,"Verification:",verifyMenu(makeVerify($uid)));
-    } else send($cid,"Join all channels.",joinMarkup());
+  /* USER */
+  if($d==="stats"){
+    $u=user($uid);
+    send($cid,
+      "📊 <b>Your Stats</b>\n\n⭐ Points: <b>{$u['points']}</b>\n👥 Referrals: <b>{$u['total_referrals']}</b>",
+      mainMenu(isAdmin($uid))
+    );
     exit;
   }
 
-  if($d==="check_verified"){
-    if(verified($uid)) send($cid,"✅ Verified!",mainMenu(isAdmin($uid)));
-    else send($cid,"Not verified.",verifyMenu(makeVerify($uid)));
-    exit;
-  }
-
-  if(!verified($uid)){
-    send($cid,"Verify first.",joinMarkup());
+  if($d==="reflink"){
+    $link="https://t.me/{$BOT_USERNAME}?start={$uid}";
+    send($cid,"🔗 <b>Your Referral Link</b>\n<code>{$link}</code>",mainMenu(isAdmin($uid)));
     exit;
   }
 
   if($d==="withdraw"){
-    send($cid,"Choose coupon:",[
+    send($cid,"🎁 <b>Select coupon</b>",[
       "inline_keyboard"=>[
-        [["text"=>"500","callback_data"=>"wd_500"]],
-        [["text"=>"1K","callback_data"=>"wd_1000"]],
-        [["text"=>"2K","callback_data"=>"wd_2000"]],
-        [["text"=>"4K","callback_data"=>"wd_4000"]],
+        [["text"=>"500 (".getWithdrawPoints(500)." pts)","callback_data"=>"wd_500"]],
+        [["text"=>"1K (".getWithdrawPoints(1000)." pts)","callback_data"=>"wd_1000"]],
+        [["text"=>"2K (".getWithdrawPoints(2000)." pts)","callback_data"=>"wd_2000"]],
+        [["text"=>"4K (".getWithdrawPoints(4000)." pts)","callback_data"=>"wd_4000"]],
         [["text"=>"⬅ Back","callback_data"=>"back_main"]]
       ]
     ]);
@@ -259,27 +212,65 @@ if(isset($up["callback_query"])){
   }
 
   if(preg_match("/wd_(\d+)/",$d,$m)){
-    $amt=(int)$m[1];
-    $need=getPointsFor($amt);
+    $amount=(int)$m[1];
+    $need=getWithdrawPoints($amount);
     $u=user($uid);
-    if($u["points"]<$need){ send($cid,"Not enough points.",mainMenu(isAdmin($uid))); exit; }
+    if($u["points"]<$need){ send($cid,"❌ Not enough points.",mainMenu(isAdmin($uid))); exit; }
 
     $pdo->beginTransaction();
-    $c=$pdo->query("SELECT id,code FROM coupons WHERE used=false LIMIT 1 FOR UPDATE")->fetch();
-    if(!$c){ $pdo->rollBack(); send($cid,"Out of stock.",mainMenu(isAdmin($uid))); exit; }
+    $c=$pdo->prepare("SELECT id,code FROM coupons WHERE used=false AND amount=? LIMIT 1 FOR UPDATE");
+    $c->execute([$amount]);
+    $cp=$c->fetch();
+    if(!$cp){ $pdo->rollBack(); send($cid,"❌ Out of stock.",mainMenu(isAdmin($uid))); exit; }
 
     $pdo->prepare("UPDATE users SET points=points-? WHERE tg_id=?")->execute([$need,$uid]);
-    $pdo->prepare("UPDATE coupons SET used=true,used_by=?,used_at=NOW() WHERE id=?")->execute([$uid,$c["id"]]);
+    $pdo->prepare("UPDATE coupons SET used=true,used_by=?,used_at=NOW() WHERE id=?")->execute([$uid,$cp["id"]]);
     $pdo->prepare("INSERT INTO withdrawals (tg_id,coupon_code,points_deducted) VALUES (?,?,?)")
-        ->execute([$uid,$c["code"],$need]);
+        ->execute([$uid,$cp["code"],$need]);
     $pdo->commit();
 
-    send($cid,"🎟 Coupon:\n<code>{$c['code']}</code>",mainMenu(isAdmin($uid)));
+    send($cid,"🎟 <b>Your Coupon</b>\n<code>{$cp['code']}</code>",mainMenu(isAdmin($uid)));
     exit;
   }
 
+  /* ADMIN */
   if($d==="admin_panel" && isAdmin($uid)){
-    send($cid,"Admin Panel:",adminMenu());
+    send($cid,"🛠 <b>Admin Panel</b>",adminMenu());
+    exit;
+  }
+
+  if($d==="admin_add_coupon" && isAdmin($uid)){
+    send($cid,"Select coupon amount:",[
+      "inline_keyboard"=>[
+        [["text"=>"500","callback_data"=>"addc_500"]],
+        [["text"=>"1K","callback_data"=>"addc_1000"]],
+        [["text"=>"2K","callback_data"=>"addc_2000"]],
+        [["text"=>"4K","callback_data"=>"addc_4000"]],
+        [["text"=>"⬅ Back","callback_data"=>"admin_panel"]]
+      ]
+    ]);
+    exit;
+  }
+
+  if(preg_match("/addc_(\d+)/",$d,$m) && isAdmin($uid)){
+    setState($uid,"add_coupon_".$m[1]);
+    send($cid,"Send coupon codes for {$m[1]}:");
+    exit;
+  }
+
+  if($d==="admin_stock" && isAdmin($uid)){
+    $r=$pdo->query("SELECT amount,COUNT(*) c FROM coupons WHERE used=false GROUP BY amount ORDER BY amount")->fetchAll();
+    $t="📦 <b>Stock</b>\n\n";
+    foreach($r as $x) $t.="{$x['amount']} : <b>{$x['c']}</b>\n";
+    send($cid,$t,adminMenu());
+    exit;
+  }
+
+  if($d==="admin_redeems" && isAdmin($uid)){
+    $r=$pdo->query("SELECT tg_id,coupon_code,created_at FROM withdrawals ORDER BY id DESC LIMIT 10")->fetchAll();
+    $t="🗂 <b>Last Redeems</b>\n\n";
+    foreach($r as $x) $t.="👤 {$x['tg_id']}\n🎟 {$x['coupon_code']}\n🕒 {$x['created_at']}\n\n";
+    send($cid,$t,adminMenu());
     exit;
   }
 
@@ -309,12 +300,12 @@ if(isset($up["callback_query"])){
     $pdo->prepare("INSERT INTO withdraw_points (amount,points) VALUES (?,?) ON CONFLICT (amount) DO UPDATE SET points=EXCLUDED.points")
         ->execute([$amt,$pts]);
     clearState($uid);
-    send($cid,"Updated.",adminMenu());
+    send($cid,"✅ Points updated.",adminMenu());
     exit;
   }
 
   if($d==="back_main"){
-    send($cid,"🏠 Menu:",mainMenu(isAdmin($uid)));
+    send($cid,"🏠 Main Menu:",mainMenu(isAdmin($uid)));
     exit;
   }
 }
