@@ -148,6 +148,7 @@ function channelsList() {
     normalizeChannel(getenv("FORCE_JOIN_5")),
     normalizeChannel(getenv("FORCE_JOIN_6")),
     normalizeChannel(getenv("FORCE_JOIN_7")),
+    normalizeChannel(getenv("FORCE_JOIN_8")),                               
   ]));
 }
 
