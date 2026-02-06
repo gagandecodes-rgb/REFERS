@@ -1,55 +1,50 @@
 <?php
-// verify.php
 error_reporting(0);
 
-$DATABASE_URL = getenv("DATABASE_URL");
-$uid = $_GET["uid"] ?? "";
+$DB_HOST=getenv("DB_HOST");
+$DB_NAME=getenv("DB_NAME");
+$DB_USER=getenv("DB_USER");
+$DB_PASS=getenv("DB_PASS");
+$DB_PORT=getenv("DB_PORT");
+$BOT_USERNAME=getenv("BOT_USERNAME");
 
-$db = parse_url($DATABASE_URL);
-$pdo = new PDO(
-  "pgsql:host={$db['host']};port={$db['port']};dbname=" . ltrim($db['path'], '/'),
-  $db['user'],
-  $db['pass'],
-  [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+$uid=$_GET['uid']??'';
+$token=$_COOKIE['device_token']??bin2hex(random_bytes(16));
+setcookie("device_token",$token,time()+31536000,"/");
+
+$pdo=new PDO(
+ "pgsql:host=$DB_HOST;port=$DB_PORT;dbname=$DB_NAME",
+ $DB_USER,$DB_PASS,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]
 );
 
-$verified = false;
-
-if ($uid && is_numeric($uid)) {
-  $stmt = $pdo->prepare("UPDATE users SET verified=true WHERE user_id=?");
-  $stmt->execute([$uid]);
-  if ($stmt->rowCount() > 0) {
-    $verified = true;
+$ok=false;
+if(is_numeric($uid)){
+  $chk=$pdo->prepare("SELECT user_id FROM users WHERE device_token=?");
+  $chk->execute([$token]);
+  if(!$chk->fetch()){
+    $pdo->prepare("UPDATE users SET verified=true, device_token=? WHERE user_id=?")
+        ->execute([$token,$uid]);
+    $ok=true;
   }
 }
 ?>
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8">
-  <title>Verification</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body{font-family:Arial;background:#0f172a;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-    .box{background:#111827;padding:22px;border-radius:14px;max-width:360px;width:92%;text-align:center}
-    .btn{display:inline-block;margin-top:16px;background:#22c55e;color:#000;padding:12px 16px;border-radius:10px;text-decoration:none;font-weight:700}
-    .err{color:#f87171}
-  </style>
-</head>
+<head><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{background:#0f172a;color:#fff;font-family:Arial;display:flex;justify-content:center;align-items:center;height:100vh}
+.box{background:#111827;padding:22px;border-radius:14px;text-align:center}
+.btn{background:#22c55e;color:#000;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:700}
+</style></head>
 <body>
-  <div class="box">
-    <h2>✅ Verification</h2>
-
-    <?php if (!$uid): ?>
-      <p class="err">UID missing. Please return to Telegram.</p>
-    <?php elseif ($verified): ?>
-      <p>You are successfully verified.</p>
-      <a class="btn" href="https://t.me/<?= htmlspecialchars(getenv('BOT_USERNAME')) ?>">
-        🔁 Return to Bot
-      </a>
-    <?php else: ?>
-      <p class="err">Verification failed. Please try again.</p>
-    <?php endif; ?>
-  </div>
+<div class="box">
+<h3>Verification</h3>
+<?php if($ok): ?>
+<p>✅ Verified</p>
+<a class="btn" href="https://t.me/<?=htmlspecialchars($BOT_USERNAME)?>">Return to Bot</a>
+<?php else: ?>
+<p>❌ Verification failed</p>
+<?php endif; ?>
+</div>
 </body>
 </html>
