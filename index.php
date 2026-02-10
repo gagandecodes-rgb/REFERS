@@ -3,11 +3,13 @@
  * ✅ FULL SINGLE-FILE index.php (Telegram Bot + Website Verify in SAME file)
  *
  * FEATURES:
- * ✅ 3 refer = 1 coupon (referral adds +1 point per new user; 3 points = 500 by default via withdraw_points)
+ * ✅ 3 refer = 1 coupon (referral adds +1 point per new user; points -> withdraw_points table)
  * ✅ Coupon stock + mark used + withdrawals log
  * ✅ Admin panel: add coupon (500/1K/2K/4K) / stock / redeems log
  * ✅ Admin: change withdraw points (500/1K/2K/4K)
- * ✅ TOTAL 7 force-join channels (FORCE_JOIN_1..FORCE_JOIN_7)
+ * ✅ Admin: 🎁 Get Code (Free) -> pick amount -> enter quantity -> bot gives THAT MANY coupons
+ * ✅ IMPORTANT: Free Get Code uses ONLY coupons where used=false in DB (available stock)
+ * ✅ TOTAL force-join channels (FORCE_JOIN_1..FORCE_JOIN_10 supported)
  * ✅ Force-join checked ONLY when user clicks "✅ Check Verification"
  * ✅ AFTER join verified -> NEW message + Verification message
  * ✅ NO "Verify Yourself" button (removed)
@@ -24,7 +26,7 @@
  * REQUIRED Render ENV:
  * BOT_TOKEN, ADMIN_ID, BOT_USERNAME (no @)
  * DB_HOST, DB_PORT(5432), DB_NAME(postgres), DB_USER, DB_PASS
- * FORCE_JOIN_1..FORCE_JOIN_7 (e.g. @channelname)
+ * FORCE_JOIN_1..FORCE_JOIN_10 (e.g. @channelname)
  *
  * REQUIRED DB (Supabase):
  * users(tg_id PK bigint, referred_by bigint, points int default 0, total_referrals int default 0,
@@ -41,6 +43,9 @@ ini_set("display_errors", 0);
 define("VERIFY_TOKEN_MINUTES", 10);
 define("TG_CONNECT_TIMEOUT", 2);
 define("TG_TIMEOUT", 6);
+
+// Free-get safety limit
+define("FREE_GET_MAX_QTY", 50);
 
 // ---------- ENV ----------
 $BOT_TOKEN    = getenv("BOT_TOKEN");
@@ -118,6 +123,21 @@ function answerCallback($callback_id, $text = "", $alert = false) {
   ]);
 }
 
+function sendLongText($chat_id, $header, $lines, $reply_markup = null) {
+  $max = 3500; // keep below Telegram 4096 limit
+  $chunk = $header;
+  foreach ($lines as $ln) {
+    $add = $ln . "\n";
+    if (strlen($chunk) + strlen($add) > $max) {
+      sendMessage($chat_id, rtrim($chunk), $reply_markup);
+      $chunk = "";
+      $reply_markup = null; // attach keyboard only once
+    }
+    $chunk .= $add;
+  }
+  if (trim($chunk) !== "") sendMessage($chat_id, rtrim($chunk), $reply_markup);
+}
+
 function normalizeChannel($s) {
   $s = trim((string)$s);
   if ($s === "") return "";
@@ -138,7 +158,7 @@ function botUsername() {
   return $me["result"]["username"] ?? "";
 }
 
-// ---------- CHANNELS (TOTAL 7) ----------
+// ---------- CHANNELS (SUPPORT UP TO 10) ----------
 function channelsList() {
   return array_values(array_filter([
     normalizeChannel(getenv("FORCE_JOIN_1")),
@@ -202,6 +222,9 @@ function adminPanelMarkup() {
     ],
     [
       ["text" => "⚙ Change Withdraw Points", "callback_data" => "admin_points"]
+    ],
+    [
+      ["text" => "🎁 Get Code (Free)", "callback_data" => "admin_free_get"]
     ],
     [
       ["text" => "⬅️ Back", "callback_data" => "back_main"]
@@ -283,7 +306,6 @@ function notifyAdminRedeem($tg_id, $coupon, $beforePoints, $afterPoints) {
 
 function getWithdrawPoints($amount) {
   global $pdo;
-  // If table missing, default to 0 (won't allow withdraw)
   try {
     $st = $pdo->prepare("SELECT points FROM withdraw_points WHERE amount=:a");
     $st->execute([":a" => (int)$amount]);
@@ -444,8 +466,9 @@ if (isset($update["message"])) {
   $from_id = $m["from"]["id"];
   $text = trim($m["text"] ?? "");
 
-  // State: admin add coupons
   $stState = getState($from_id);
+
+  // State: admin add coupons
   if (isAdmin($from_id) && preg_match("/^await_coupon_(500|1000|2000|4000)$/", $stState, $mm) && $text !== "" && strpos($text, "/") !== 0) {
     $amount = (int)$mm[1];
     $codes = preg_split("/\r\n|\n|\r|,|\s+/", $text);
@@ -476,6 +499,74 @@ if (isset($update["message"])) {
     clearState($from_id);
     sendMessage($chat_id, "✅ Points updated for <b>{$amount}</b> → <b>{$pts}</b> points.", adminPanelMarkup());
     http_response_code(200); echo "OK"; exit;
+  }
+
+  // State: ADMIN FREE GET -> quantity input (only picks used=false coupons)
+  if (isAdmin($from_id) && preg_match("/^freeqty_(500|1000|2000|4000)$/", $stState, $mm) && $text !== "" && strpos($text, "/") !== 0) {
+    $amount = (int)$mm[1];
+    $qty = (int)trim($text);
+    if ($qty < 1) $qty = 1;
+    if ($qty > FREE_GET_MAX_QTY) $qty = FREE_GET_MAX_QTY;
+
+    try {
+      $pdo->beginTransaction();
+
+      // Lock + pick from available stock only (used=false)
+      $st = $pdo->prepare("
+        SELECT id, code
+        FROM coupons
+        WHERE used=false AND amount=:amt
+        ORDER BY id ASC
+        LIMIT :lim
+        FOR UPDATE SKIP LOCKED
+      ");
+      $st->bindValue(":amt", $amount, PDO::PARAM_INT);
+      $st->bindValue(":lim", $qty, PDO::PARAM_INT);
+      $st->execute();
+      $rows = $st->fetchAll();
+
+      if (!$rows) {
+        $pdo->rollBack();
+        clearState($from_id);
+        sendMessage($chat_id, "⚠️ No coupons available (used=false) for <b>{$amount}</b> right now.", adminPanelMarkup());
+        http_response_code(200); echo "OK"; exit;
+      }
+
+      $ids = [];
+      $codes = [];
+      foreach ($rows as $r) { $ids[] = (int)$r["id"]; $codes[] = $r["code"]; }
+
+      // Mark them used by ADMIN so they can't be taken again
+      $in = implode(",", array_fill(0, count($ids), "?"));
+      $sql = "UPDATE coupons SET used=true, used_by=?, used_at=NOW() WHERE id IN ($in)";
+      $params = array_merge([(int)$from_id], $ids);
+      $pdo->prepare($sql)->execute($params);
+
+      // Log as withdrawals (0 points) so admin_redeems shows it too
+      $ins = $pdo->prepare("INSERT INTO withdrawals (tg_id, coupon_code, points_deducted) VALUES (:tg,:c,0)");
+      foreach ($codes as $c) $ins->execute([":tg" => $from_id, ":c" => $c]);
+
+      $pdo->commit();
+      clearState($from_id);
+
+      $got = count($codes);
+      $header = "🎁 <b>Free Codes ({$amount})</b>\n✅ Given: <b>{$got}</b>\n\n";
+      $lines = array_map(function($c){ return "<code>{$c}</code>"; }, $codes);
+
+      sendLongText($chat_id, $header, $lines, adminPanelMarkup());
+
+      if ($got < $qty) {
+        sendMessage($chat_id, "⚠️ Stock was less than requested.\nRequested: <b>{$qty}</b>\nGiven: <b>{$got}</b>", adminPanelMarkup());
+      }
+
+      http_response_code(200); echo "OK"; exit;
+
+    } catch (Exception $e) {
+      if ($pdo && $pdo->inTransaction()) $pdo->rollBack();
+      clearState($from_id);
+      sendMessage($chat_id, "⚠️ Error while getting free codes. Try again.", adminPanelMarkup());
+      http_response_code(200); echo "OK"; exit;
+    }
   }
 
   // /start with referral
@@ -698,11 +789,25 @@ if (isset($update["callback_query"])) {
     http_response_code(200); echo "OK"; exit;
   }
 
-  // ADMIN: STOCK
+  // ADMIN: 🎁 GET CODE (FREE)
+  if ($data === "admin_free_get") {
+    if (!isAdmin($from_id)) { sendMessage($chat_id, "❌ Not allowed."); http_response_code(200); echo "OK"; exit; }
+    sendMessage($chat_id, "🎁 <b>Select amount to get free codes</b>", adminAmountOptionsKb("free", "admin_panel"));
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if (preg_match("/^free_(500|1000|2000|4000)$/", $data, $m) && isAdmin($from_id)) {
+    $amount = (int)$m[1];
+    setState($from_id, "freeqty_" . $amount);
+    sendMessage($chat_id, "✏️ Enter how many <b>{$amount}</b> coupons you need (max ".FREE_GET_MAX_QTY."):");
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  // ADMIN: STOCK (only unused / used=false)
   if ($data === "admin_stock") {
     if (!isAdmin($from_id)) { sendMessage($chat_id, "❌ Not allowed."); http_response_code(200); echo "OK"; exit; }
     $rows = $pdo->query("SELECT amount, COUNT(*) c FROM coupons WHERE used=false GROUP BY amount ORDER BY amount")->fetchAll();
-    $text = "📦 <b>Coupon Stock</b>\n\n";
+    $text = "📦 <b>Coupon Stock (used=false)</b>\n\n";
     if (!$rows) $text .= "No coupons available.";
     else foreach ($rows as $r) $text .= "🎁 <b>{$r['amount']}</b>: <b>{$r['c']}</b>\n";
     sendMessage($chat_id, $text, adminPanelMarkup());
